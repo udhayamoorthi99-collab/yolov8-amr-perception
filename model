@@ -1,0 +1,643 @@
+# "Vision based with YOLOv8 of AMR "
+
+# Environment : Google colab
+# Dateset : LOCO (logistics Object in Context ) with COCO formate bounding boxes
+
+import os
+from pathlib import Path
+import json
+
+PROJECT = "YOLOv8-AMR-preception"
+
+folder =[
+    f"{PROJECT}/config",
+    f"{PROJECT}/data/raw",
+    f"{PROJECT}/data/interim",
+    f"{PROJECT}/data/yolo/images/train",
+    f"{PROJECT}/data/yolo/images/val",
+    f"{PROJECT}/data/yolo/images/test",
+    f"{PROJECT}/data/yolo/labels/train",
+    f"{PROJECT}/data/yolo/labels/val",
+    f"{PROJECT}/data/yolo/labels/test",
+    f"{PROJECT}/models/checkpoints",
+    f"{PROJECT}/models/exported",
+    f"{PROJECT}/src/utils",
+    f"{PROJECT}/src/training",
+    f"{PROJECT}/src/inference",
+    f"{PROJECT}/scripts"
+
+]
+
+for f in folder:
+  os.makedirs(f, exist_ok = True)
+
+# print("Project created at :", Path(PROJECT).resolve())
+
+Raw_dir = Path(PROJECT)/"data"/"raw"
+Raw_dir.mkdir(parents= True, exist_ok=True)
+"""
+!rm -rf "$Raw_dir/loco_annotated"
+!mkdir -p "$Raw_dir/loco_annotated"
+!unzip -q "$Raw_dir/loco_annotated.zip" -d "$Raw_dir/loco_annotated"
+"""
+ANN_DIR = Path(Raw_dir)/"annotations"
+ANN_DIR.mkdir(parents=True, exist_ok=True)
+
+url = "https://go.mytum.de/239870"
+zip_path = Raw_dir / "loco_annotated.zip"
+
+if not zip_path.exists():
+# if the line starts with ! then it runs
+    print("DOWNLOADING DATASET STARTS >>>>>>>")
+    !wget -O "{zip_path}" "{url}"
+else:
+    print("Zip already exists. Skipping download.")
+!ls -lh "{Raw_dir}"
+
+
+extract_dir = Raw_dir / "loco_annotated"
+
+
+if not extract_dir.exists():
+  print(" EXTRACTING DATASET STARTS >>>>>>>>>>>>>>>>>")
+  !unzip -q "{zip_path}" -d "{extract_dir}"
+else :
+  print("Dataset is already found and extracted. SKIPPING UNZIP")
+#!find "{extract_dir}" -maxdepth 3 -type d | head -n 80
+#!find "{extract_dir}" -type f | head -n 60
+
+import glob
+
+json_path = ANN_DIR/ "loco-all-v1.json"
+url = "https://raw.githubusercontent.com/tum-fml/loco/main/rgb/loco-all-v1.json"
+
+def ensure_nonempty_file(p: Path):
+    return p.exists() and p.stat().st_size > 0
+
+# If file exists but is empty (from a failed wget), delete it
+if json_path.exists() and json_path.stat().st_size == 0:
+    print("Found 0-byte JSON (failed earlier download). Deleting it.")
+    json_path.unlink()
+
+# Download only if missing OR empty
+if not ensure_nonempty_file(json_path):
+    print("DOWNLOADING JSON DATASET STARTS >>>>>")
+
+    # Prefer curl with robust retries
+    !rm -f "{json_path}"
+    !curl -L --retry 20 --retry-all-errors --retry-delay 5 \
+        -o "{json_path}" "{url}"
+
+#Verify after download
+!ls -lh "{ANN_DIR}"
+print("JSON size (bytes):", json_path.stat().st_size)
+
+# Quick sanity: show first chars (should start with '{')
+head = json_path.read_text(encoding="utf-8", errors="replace")[:200]
+print("JSON head:", head.replace("\n", "\\n"))
+
+if not ensure_nonempty_file(json_path):
+    raise ValueError(f"JSON is still empty. Download failed. Path: {json_path}")
+
+# Load safely
+with open(json_path, "r", encoding="utf-8") as f:
+    coco = json.load(f)
+
+print("images:", len(coco.get("images", [])))
+print("annotations:", len(coco.get("annotations", [])))
+print("categories:", len(coco.get("categories", [])))
+
+
+
+'''
+
+
+if not json_path.exists():
+  print("DOWNLOADING JSON DATASET STARTS >>>>>")
+  !wget -O "{json_path}" "{url}"
+else :
+  print("Dataset is already found . SKIPPING DOWNLOAD")
+!ls -lh "{ANN_DIR}"
+
+
+Ann_path = Path(json_path)
+print(Ann_path.read_text()[:500])
+coco = json.loads(Ann_path.read_text(encoding="utf-8"))
+print("the length of json file : ",len(coco))
+print("images : ", len(coco["images"]))
+print("annotation : ", len(coco["annotations"]))
+'''
+# check the categories id , wheather the json works
+print("\nCategories (id -> name):")
+for c in coco["categories"]:
+    print(c["id"], "->", c["name"])
+
+
+# local images missing
+local_image = list(extract_dir.rglob("*.jpg"))
+base = {p.name for p  in local_image}
+base_coco= {Path(p["file_name"]).name for p in coco["images"]}
+print("BASE COCO", len(base_coco))
+length_base = len(base)
+length_coco = len(base_coco)
+inter = len(base.intersection(base_coco))
+missing_base = length_base - inter
+missing_coco = length_coco - inter
+print(inter)
+print(missing_coco)
+print("missing imgaes : ", missing_base+ missing_coco)
+
+
+
+# <<<<<<<<<<<<<<<<     SCRIPT FOR TRAIN AND VAL SET CONVERSION FROM COCO TO YOLO          >>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+
+
+script_path = Path(PROJECT) / "scripts" / "coco_to_yolo_split.py"
+script_path.parent.mkdir(parents=True, exist_ok=True)
+
+script_path.write_text(r'''
+import argparse
+import json
+import shutil
+import random
+
+from pathlib import Path
+
+
+def clamp(x: float):
+  return max(0.0, min(1.0, x))
+
+def coco_bbox_to_yolo(bbox_xywh, img_w, img_h):
+  x, y, w, h = bbox_xywh
+
+  x_c = x + w / 2.0
+  y_c = y + h / 2.0
+
+  xcn = x_c / img_w
+  ycn = y_c / img_h
+  wn  = w   / img_w
+  hn  = h   / img_h
+
+  return (clamp(xcn), clamp(ycn), clamp(wn), clamp(hn))
+
+def parse_args():
+  p = argparse.ArgumentParser(description= " Convert the COCO bbox to YOLO formate with train and Val split.")
+  p.add_argument("--coco_json", type=str, required=True)
+  p.add_argument("--images_root", type=str, required=True, help="Root folder containing images (nested OK)")
+  p.add_argument("--out_root", type=str, required=True, help="Output YOLO root (contains images/ and labels/)")
+  p.add_argument("--val_ratio", type=float, default=0.2)
+  p.add_argument("--seed", type=int, default=42)
+  p.add_argument("--keep_classes", type=str, default="", help="Optional comma-separated class names to keep")
+  return p.parse_args()
+
+def main():
+  args = parse_args()
+  random.seed(args.seed)
+
+  coco_path = Path(args.coco_json)
+  image_root = Path(args.images_root)
+  out_root = Path(args.out_root)
+
+  coco = json.loads(coco_path.read_text(encoding="utf-8"))
+  print("the length of json file : ",len(coco))
+  print("images : ", len(coco["images"]))
+  print("annotation : ", len(coco["annotations"]))
+
+  # categories
+  cat_name = {c["id"] :c ["name"] for c in coco["categories"]}
+  keep_names = [ s.strip() for s in args.keep_classes.split(",") if s.strip()]
+  if keep_names:
+        keep_cat_ids = {cid for cid, name in cat_name.items() if name in keep_names}
+  else:
+        keep_cat_ids = set(cat_name.keys())
+
+  kept = sorted([(cid, cat_name[cid]) for cid in keep_cat_ids], key=lambda x: x[0])
+  name_to_yolo = {name: i for i, (_, name) in enumerate(kept)}
+  cat_id_to_yolo = {cid: name_to_yolo[cat_name[cid]] for cid in keep_cat_ids}
+
+  print("Kept classes (YOLO id -> name):")
+  for name, idx in sorted(name_to_yolo.items(), key=lambda x: x[1]):
+      print(idx, "->", name)
+
+  # local images index by basename
+  img_files = list(image_root.rglob("*.jpg"))
+  base_to_path = {p.name: p for p in img_files}
+  print(f"Local image files found: {len(img_files)}")
+
+  # COCO images meta [image_id = filename , w , h]
+  img_id_to_meta = {}
+  for images in coco["images"]:
+      img_id_to_meta[images["id"]] = (Path(images["file_name"]).name, images["width"], images["height"])
+
+  # group annotations by image_id
+  ann_by_img = {}
+  for ann in coco["annotations"]:
+      if ann.get("iscrowd", 0) == 1:
+          continue
+      cid = ann["category_id"]
+      if cid not in keep_cat_ids:
+          continue
+      ann_by_img.setdefault(ann["image_id"], []).append(ann)
+
+  # only keep images that exist locally
+
+  valid_img_ids = [img_id for img_id, (bn, _, _) in img_id_to_meta.items() if bn in base_to_path]
+  random.shuffle(valid_img_ids)
+
+  n_val = int(len(valid_img_ids) * args.val_ratio)
+  val_ids = set(valid_img_ids[:n_val])
+  train_ids = set(valid_img_ids[n_val:])
+# output dirs
+  out_img_train = out_root / "images" / "train"
+  out_img_val   = out_root / "images" / "val"
+  out_lbl_train = out_root / "labels" / "train"
+  out_lbl_val   = out_root / "labels" / "val"
+
+  for d in [out_img_train, out_img_val, out_lbl_train, out_lbl_val]:
+      d.mkdir(parents=True, exist_ok=True)
+
+  def process(img_id, split):
+      bn, w, h = img_id_to_meta[img_id]
+      src = base_to_path[bn]
+
+      if split == "train":
+          dst_img = out_img_train / bn
+          dst_lbl = out_lbl_train / (Path(bn).stem + ".txt")
+      else:
+          dst_img = out_img_val / bn
+          dst_lbl = out_lbl_val / (Path(bn).stem + ".txt")
+
+      # copy image
+      if not dst_img.exists():
+          shutil.copy2(src, dst_img)
+
+      anns = ann_by_img.get(img_id, [])
+      lines = []
+      for ann in anns:
+          cls = cat_id_to_yolo[ann["category_id"]]
+          x_c, y_c, wn, hn = coco_bbox_to_yolo(ann["bbox"], w, h)
+          lines.append(f"{cls} {x_c:.6f} {y_c:.6f} {wn:.6f} {hn:.6f}")
+
+      dst_lbl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+  for img_id in train_ids:
+      process(img_id, "train")
+  for img_id in val_ids:
+      process(img_id, "val")
+
+  print("\nDone.")
+  print("Train images:", len(train_ids))
+  print("Val images:", len(val_ids))
+  print("YOLO dataset written to:", out_root)
+
+  # write class names to a txt for convenience
+  names_txt = out_root / "class_names.txt"
+  ordered_names = [None] * len(name_to_yolo)
+  for name, idx in name_to_yolo.items():
+      ordered_names[idx] = name
+  names_txt.write_text("\n".join(ordered_names) + "\n", encoding="utf-8")
+  print("Class names saved to:", names_txt)
+
+if __name__ == "__main__":
+  main()
+
+
+
+''', encoding="utf-8")
+print("Wrote : ", script_path)
+
+!python "{PROJECT}/scripts/coco_to_yolo_split.py" \
+  --coco_json "{PROJECT}/data/raw/annotations/loco-all-v1.json" \
+  --images_root "{PROJECT}/data/raw/loco_annotated" \
+  --out_root "{PROJECT}/data/yolo" \
+  --val_ratio 0.2 \
+  --seed 42
+
+
+#<<<<<<<<<<<<<<<     THIS IS T CONVERT TO YAML FORMATE   >>>>>>>>>
+
+
+import yaml
+
+PROJECT = "YOLOv8-AMR-preception"
+names_path = Path(PROJECT)/"data"/"yolo"/"class_names.txt"
+names = [line.strip() for line in names_path.read_text().splitlines() if line.strip() ]
+
+data_yaml = {
+    "path": f"./{PROJECT}/data/yolo",
+    "train": "images/train",
+    "val": "images/val",
+    "nc": len(names),
+    "names": {i: n for i, n in enumerate(names)}
+}
+
+out_yaml = Path(PROJECT)/ "config"/ "data.yaml"
+out_yaml.write_text(yaml.dump(data_yaml, sort_keys=False),encoding= "utf-8")
+
+print("wrote :", out_yaml)
+
+print(out_yaml.read_text())
+
+
+# <<<<<<<<<<<<<<<<< Training YOLO >>>>>>>>>>>>>>.
+
+train_file = Path(PROJECT)/ 'src'/'training'/'train_yolov8.py'
+
+train_file.write_text('''
+from ultralytics import YOLO
+import argparse
+from pathlib import Path
+
+
+
+def parse_args():
+  p = argparse.ArgumentParser(description="TRAIN Yolov8n.pt ")
+  p.add_argument("--project", type = str , default="models/checkpoints", help = "save runs")
+  p.add_argument("--data", type=str , default="config/data.yaml" , help="Path to the yolo yaml data ")
+  p.add_argument("--model", type=str , default="yolov8n.pt" , help="the basic version for yolov8 are (n, s, l , x)")
+  p.add_argument("--epochs", type=int , default=50 , help="the number of time epochs , better (50 - 200)")
+  p.add_argument("--imgsz", type=int , default=640 , help="image size can be 320, 640, 1024")
+  p.add_argument("--batch", type=int , default= 16 , help=" Basic = 16 - 32")
+  p.add_argument("--device", type= str , default= "0" , help="GPU = 0 , cpu ")
+  p.add_argument("--name", type=str , default="AMR_Yolov8" , help="the name of the project")
+  p.add_argument("--workers", type=int , default=8 , help=" number of core engaged for the training of the model ")
+  p.add_argument("--patience", type= int , default=20 , help="Early stopping patiences")
+  p.add_argument("--seed", type= int, default= 42 , help=" the randomness of the training")
+  return p.parse_args()
+
+def main():
+  arg = parse_args()
+
+
+  project_root = Path(__file__).resolve().parents[2]
+  print(__file__)
+  print(Path(project_root))
+  data_path = (project_root/arg.data).resolve()
+  project_dir = (project_root/arg.project).resolve()
+
+  model = YOLO(arg.model)
+
+
+  model_train = model.train(
+      data = str(data_path),
+      epochs= arg.epochs,
+      imgsz = arg.imgsz,
+      batch = arg.batch,
+      device= arg.device,
+      project = str(project_dir),
+      workers = arg.workers,
+      #patience = arg.patience,
+      name = arg.name,
+      seed= arg.seed,
+      save = True,
+      plots = True,
+      val = True
+  )
+
+
+  print("best weights :" , getattr(model_train, "best", "See runs folder"))
+  print("Last weights :", getattr(model_train, "last", "See run folder"))
+  print(f"run directory :{project_dir/arg.name}")
+
+if __name__ == "__main__":
+  main()
+
+''', encoding="utf-8")
+
+print("wrote :", train_file)
+
+!python YOLOv8-AMR-preception/src/training/train_yolov8.py \
+  --model yolov8n.pt \
+  --data config/data.yaml \
+  --epochs 50 \
+  --imgsz 960 \
+  --device 0\
+  --batch 16 \
+  --project models/checkpoints \
+  --name amr_exp3
+
+#>>>>>>>>>>>>>>>>>>>>>>>>>> INFERENCE MODULE <<<<<<<<<<<<<<<<<<<<<<<
+inference_file = Path(PROJECT)/ "src" / "inference"/"infer_image.py"
+inference_file.write_text('''
+from pathlib import Path
+import argparse
+from ultralytics import YOLO
+
+
+def parse_arg():
+  p = argparse.ArgumentParser(description= " YOLO v8 inference module")
+  p.add_argument("--weights", type = str , required= True , help ="the best weight from the stored output of the trainning ")
+  p.add_argument("--source" , type = str  , required= True ,  help = " the source of path file or the file ")
+  p.add_argument("--conf" , type = float  ,default= 0.25, help = " the confindence threshold it can be around 0.25 to 0.50 ")
+  p.add_argument("--iou", type  = float , default =0.45, help="the Intersection and union value should above 0.45  "  )
+  p.add_argument("--imgsz", type = int , default = 640 , help = " the image size is should be some where in 320, 640, 1024")
+  p.add_argument("--device", type = str, default = "0", help= "the Gpu = 0 , cpu ")
+  p.add_argument("--project", type = str , default = "runs/detect", help = " the output root folders")
+  p.add_argument("--name", type = str , default = "amr_predict_images", help = " the output run name")
+  p.add_argument("--classes", type = str, default="", help= "optional")
+
+  return p.parse_args()
+
+
+def main():
+  arg = parse_arg()
+
+  cls = None
+  if arg.classes.strip():
+    cls = [ int(x.strip())for x in arg.classes.split(",") if x.strip()]
+
+  model = YOLO(arg.weights)
+
+  model_inference = model.predict(
+      source = arg.source,
+      conf = arg.conf,
+      iou = arg.iou,
+      imgsz = arg.imgsz,
+      device = arg.device,
+      save = True,
+      show = True ,
+      project = arg.project,
+      name= arg.name,
+      classes = cls
+  )
+
+  n = len(model_inference)
+  print(f"inference Completed . No of result object : {n}")
+  out_dir = Path(arg.project) / arg.name
+  print("output saved in : ",out_dir.resolve())
+
+
+if __name__ == "__main__":
+  main()
+''', encoding="utf-8")
+
+print("wrote :", inference_file)
+
+!python YOLOv8-AMR-preception/src/inference/infer_image.py\
+  --source   YOLOv8-AMR-preception/data/yolo/images/val \
+  --weights  YOLOv8-AMR-preception/models/checkpoints/amr_exp3/weights/best.pt \
+  --conf 0.001\
+  --iou 0.70\
+  --imgsz 960\
+  --device 0\
+  --project  YOLOv8-AMR-preception/runs/detect \
+  --name amr_val_demo
+
+
+import cv2
+import matplotlib.pyplot as plt
+
+
+
+out_dir = Path("YOLOv8-AMR-preception/runs/detect/amr_val_demo")
+img = list(out_dir.glob("*.jpg"))
+
+print("saved image :", len(img))
+if img :
+  img = cv2.imread(str(img[5]))
+  img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+  plt.imshow(img)
+  plt.show()
+
+# <<<<<<<<<<<<<<<<<<<< METRICES >>>>>>>>>>>>>.
+
+from ultralytics import YOLO
+
+weights = f"{PROJECT}/models/checkpoints/amr_exp3/weights/best.pt"
+data_yaml = f"{PROJECT}/config/data.yaml"
+
+model = YOLO(weights)
+
+model_metrices = model.val(
+    data = data_yaml,
+    imgsz = 960,
+    batch = 16,
+    conf = 0.001,
+    iou = 0.5,
+    plots= True,
+    split = "val"
+)
+
+print(" Done validation metrices : " ,type(model_metrices))
+
+try:
+  box = model_metrices.box
+  print("p :", getattr(box, "p", None))
+  print("R :", getattr(box, "r", None))
+  print("mAP50 :", getattr(box, "map50", None))
+  print("mAP50 -95 :", getattr(box, "map", None))
+except Exception as e :
+  print(" Could not access metrics field directly :", e)
+  print("Raw metrics object :", model_metrices)
+
+
+
+from PIL import Image
+
+
+def show_image(img_path, title):
+  img = Image.open(img_path)
+  plt.imshow(img)
+  plt.title(title)
+  plt.axis("off")
+  plt.show()
+
+show_image("YOLOv8-AMR-preception/models/checkpoints/amr_exp3/results.png",
+           "Model Training Results")
+
+#show_image("/content/runs/detect/val/confusion_matrix.png", "Confusion Matrix")
+
+
+
+
+
+!find  /content/YOLOv8-AMR-preception -type d
+
+import shutil
+
+
+repo_dir = Path(PROJECT) / "reports"
+repo_dir.mkdir(parents=True, exist_ok=True)
+
+run_dir = Path("runs/detect")
+val_dir = sorted([p for p in run_dir.glob("val*")], key = lambda x: x.stat().st_mtime)
+print(val_dir)
+latest = val_dir[-1]
+
+dst = repo_dir/ "val_latest"
+if dst.exists():
+  shutil.rmtree(dst)
+shutil.copytree(latest, dst)
+
+print("copied evaluation artifacts : ", dst.resolve())
+
+
+lines=[]
+box = model_metrices.box
+p = getattr(box, "p", None)
+r = getattr(box, "r", None)
+map50 = getattr(box, "map50", None)
+map50_95 = getattr(box, "map", None)
+
+lines.append("# Validation Results\n")
+lines.append("This section summarizes YOLOv8 validation performance on the LOCO-based AMR perception dataset.\n")
+lines.append("## Key Metrics\n")
+lines.append(f"- Precision (P): {p}\n")
+lines.append(f"- Recall (R): {r}\n")
+lines.append(f"- mAP@0.5: {map50}\n")
+lines.append(f"- mAP@0.5:0.95: {map50_95}\n")
+lines.append("\n## Plots\n")
+lines.append("- Training/validation curves: `reports/val_latest/results.png`\n")
+lines.append("- Confusion matrix: `reports/val_latest/confusion_matrix.png`\n")
+lines.append("- PR curve: `reports/val_latest/PR_curve.png`\n")
+lines.append("- F1 curve: `reports/val_latest/F1_curve.png`\n")
+
+
+out_md = Path(PROJECT)/ "reports" / "RESULTS.md"
+out_md.write_text("".join(lines), encoding="utf-8")
+print("Wrote:", out_md)
+print(out_md.read_text())
+
+
+# <<<<<<<<<<<<<<<<<  ONNX FORMATE >>>>>>>>>>.
+
+weights = f"YOLOv8-AMR-preception/models/checkpoints/amr_exp3/weights/best.pt"
+export_dir = Path(PROJECT) / "models" / "exported"
+export_dir.mkdir(parents=True, exist_ok=True)
+
+model_onnx = YOLO(weights)
+model_onnx.export(format="onnx", opset=12, dynamic = True)
+
+
+print(" ONNX is exported")
+
+onnx_files = list(Path(".").rglob("*.onnx"))
+
+print("ONNX file found :", len(onnx_files))
+for f in onnx_files[:10]:
+    print(f)
+
+
+latest = max(onnx_files, key=lambda x: x.stat().st_mtime)
+dst = export_dir/ latest.name
+shutil.copy2(latest, dst)
+
+print("Copied ONNX to:", dst.resolve())
+
+
+onnx_path = f"{PROJECT}/models/exported/best.onnx"  # update if filename differs
+sample = f"{PROJECT}/data/yolo/images/val"
+
+onnx_model_pre = YOLO(onnx_path)
+onnx_model_pre.predict(source=sample,
+                       conf = 0.025,
+                       show=True,
+                       save = True,
+                       project=f"{PROJECT}/runs/detect", name="onnx_sanity")
+print("ONNX sanity outputs saved to:", f"{PROJECT}/runs/detect/onnx_sanity")
+
+
+
+
+
