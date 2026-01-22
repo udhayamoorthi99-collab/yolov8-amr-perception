@@ -65,6 +65,7 @@ image 506/1019 /content/YOLOv8-AMR-preception/data/yolo/images/val/1576595674.28
 
 ## Evaluation 
 Model performance is evaluated using:
+
 p : [    0.78331     0.80155     0.77405     0.80099     0.77123]
 R : [    0.64408     0.71545     0.71399     0.69819     0.68653]
 mAP50 : 0.7597630588072724
